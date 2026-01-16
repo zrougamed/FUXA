@@ -1,0 +1,93 @@
+# Build stage
+FROM node:18-bookworm-slim AS builder
+
+ARG NODE_SNAP=false
+
+WORKDIR /usr/src/app
+
+# Install only build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    dos2unix \
+    build-essential \
+    unixodbc-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone repository
+COPY . FUXA
+
+# Setup ODBC drivers
+WORKDIR /usr/src/app/FUXA/odbc
+RUN dos2unix install_odbc_drivers.sh && \
+    chmod +x install_odbc_drivers.sh && \
+    ./install_odbc_drivers.sh
+
+# Install Node dependencies
+WORKDIR /usr/src/app/FUXA/server
+
+# Configure npm for reliability
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
+RUN npm config set registry https://registry.npmjs.org/ && \
+    npm config set fetch-retries 8 && \
+    npm config set fetch-retry-factor 2 && \
+    npm config set fetch-retry-mintimeout 30000 && \
+    npm config set fetch-retry-maxtimeout 300000 && \
+    npm config set audit false && \
+    npm config set fund false
+
+# Install dependencies with retry logic
+RUN for i in 1 2 3 4 5; do \
+      echo "npm install - attempt $i/5" && \
+      npm ci --prefer-offline --no-audit --no-fund --network-timeout=600000 && break || \
+      (echo "Failed, waiting $((10*i))s..." && sleep $((10*i))); \
+    done
+
+# Install optional dependencies
+RUN if [ "$NODE_SNAP" = "true" ]; then npm install node-snap7; fi
+
+# Build sqlite3 from source
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sqlite3 \
+    libsqlite3-dev \
+    && npm install --build-from-source --sqlite=/usr/bin sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Production stage
+FROM node:18-bookworm-slim
+
+WORKDIR /usr/src/app/FUXA/server
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    unixodbc \
+    sqlite3 \
+    libsqlite3-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy ODBC configuration
+COPY --from=builder /usr/src/app/FUXA/odbc/odbcinst.ini /etc/odbcinst.ini
+COPY --from=builder /usr/src/app/FUXA/odbc /usr/src/app/FUXA/odbc
+
+# Copy application and node_modules
+COPY --from=builder /usr/src/app/FUXA/server/node_modules ./node_modules
+COPY --from=builder /usr/src/app/FUXA/server/package*.json ./
+
+# Copy remaining application files (if ADD . was meant to copy local files)
+# If no local files exist, remove this line
+COPY server /usr/src/app/FUXA/server
+RUN mkdir -p /usr/src/app/FUXA/client
+COPY client/dist /usr/src/app/FUXA/server/dist
+
+# Create non-root user for security
+RUN groupadd -r fuxa && useradd -r -g fuxa fuxa && \
+    chown -R fuxa:fuxa /usr/src/app
+
+USER fuxa
+
+EXPOSE 1881
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:1881/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))" || exit 1
+
+CMD ["npm", "start"]
